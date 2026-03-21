@@ -129,18 +129,23 @@ class BankRAG:
 
         chunk_id = 0
         for entry in entries:
-            if entry.get("status") == "ok" and entry.get("text"):
-                chunks = _chunk_text(entry["text"], entry["bank"], entry["category"])
-                for chunk in chunks:
-                    # Prepend bank+category to the document for better embedding context
-                    doc_text = f"{chunk['bank']} | {chunk['category']}\n{chunk['text']}"
-                    documents.append(doc_text)
-                    metadatas.append({
-                        "bank": chunk["bank"],
-                        "category": chunk["category"],
-                    })
-                    ids.append(f"chunk_{chunk_id}")
-                    chunk_id += 1
+            text = entry.get("text", "")
+            if not text or not text.strip():
+                continue
+            bank = entry["bank"]
+            category = entry["category"]
+            url = entry.get("url", "")
+            chunks = _chunk_text(text, bank, category)
+            for chunk in chunks:
+                doc_text = f"{chunk['bank']} | {chunk['category']}\n{chunk['text']}"
+                documents.append(doc_text)
+                metadatas.append({
+                    "bank": chunk["bank"],
+                    "category": chunk["category"],
+                    "url": url,
+                })
+                ids.append(f"chunk_{chunk_id}")
+                chunk_id += 1
 
         if not documents:
             logger.error("No chunks created from bank data")

@@ -43,9 +43,10 @@ Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
 
 ```
 Voice_Agent/
-├── stt_agent.py        # Main LiveKit agent — STT pipeline + RAG integration
+├── banks_config.py     # Bank URLs and scraping methods (edit this to add banks)
+├── scraper.py          # Generic scraping engine (driven by banks_config.py)
 ├── rag.py              # ChromaDB vector retrieval + Llama answer generation
-├── scraper.py          # Bank website scraper (4 banks × 3 categories)
+├── stt_agent.py        # Main LiveKit agent — STT pipeline + RAG integration
 ├── generate_token.py   # LiveKit room token generator for testing
 ├── requirements.txt    # Python dependencies
 ├── data/
@@ -120,10 +121,15 @@ Open the printed Meet URL in your browser to join the room with your microphone.
 
 ## Scalability
 
-Adding a new bank requires:
+Adding a new bank requires editing **only** `banks_config.py`:
 
-1. Add a scraper function in `scraper.py` (follow existing patterns)
-2. Register it in `BANK_SCRAPERS` dict
-3. Re-run `python scraper.py`
+```python
+"NewBank": {
+    "method": "selenium",  # or "html" or "api"
+    "credits": ["https://newbank.am/loans", "https://newbank.am/loans/consumer"],
+    "deposits": ["https://newbank.am/deposits"],
+    "branches": ["https://newbank.am/branches"],
+},
+```
 
-The RAG system automatically indexes any new data. No changes needed in `rag.py` or `stt_agent.py`.
+Then re-run `python scraper.py`. No changes needed in `scraper.py`, `rag.py`, or `stt_agent.py`.
