@@ -185,3 +185,6 @@ chromedriver.exe
 
 # Scraped data (re-generate with: python scraper.py)
 data/bank_data.json
+
+# ChromaDB vector store (re-generate by running the agent)
+data/chroma_db/
