@@ -2,7 +2,7 @@
 LiveKit STT Agent using Groq's Whisper API (free, fast).
 Joins a LiveKit room, listens to participant audio, and transcribes Armenian speech.
 Post-processes transcriptions with Llama to fix typos, inaccuracies, and grammar.
-Speaks answers back via Facebook MMS-TTS (Armenian voice).
+Speaks answers back via OpenAI TTS (Armenian voice).
 
 Usage:
     python stt_agent.py connect --room test-room   # Connect directly to a room
@@ -11,7 +11,6 @@ Usage:
 """
 
 import asyncio
-import functools
 import io
 import logging
 import os
@@ -19,14 +18,13 @@ import re
 import wave
 
 import numpy as np
-import torch
 from dotenv import load_dotenv
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 from livekit import agents, rtc
 from livekit.agents import stt
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions, NotGivenOr
 from livekit.plugins.silero import VAD
-from transformers import VitsModel, AutoTokenizer
 
 from pathlib import Path
 load_dotenv(Path(__file__).parent / ".env.local")
@@ -40,7 +38,9 @@ WHISPER_LANGUAGE = "hy"  # Armenian
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
 TTS_CHUNK_MS = 50
-MMS_MODEL_NAME = "facebook/mms-tts-hyw"
+OPENAI_TTS_MODEL = "tts-1"
+OPENAI_TTS_VOICE = "nova"
+OPENAI_TTS_SAMPLE_RATE = 24000
 
 POST_PROCESSOR_SYSTEM_PROMPT = """\
 You are an Armenian text post-processor for a banking voice assistant STT system.
@@ -69,24 +69,147 @@ Rules:
 - If the input is already clean, return it unchanged
 - If the input is just noise or silence artifacts (e.g. 'Subtitle', 'Thank you', repeated single characters), return exactly: NOISE"""
 
-TTS_NORMALIZER_PROMPT = """\
-You are a text normalizer preparing Armenian text for a TTS (text-to-speech) engine.
-The TTS cannot read digits, symbols, or abbreviations \u2014 you must convert them ALL to Armenian words.
+# ─── Deterministic Armenian number-to-words converter ─────────────────
 
-Convert:
-- Numbers: "15" \u2192 "\u057f\u0561\u057d\u0576\u0570\u056b\u0576\u0563"
-- Percentages: "15%" \u2192 "\u057f\u0561\u057d\u0576\u0570\u056b\u0576\u0563 \u057f\u0578\u056f\u0578\u057d"
-- Currency: "3,000,000 AMD" \u2192 "\u0565\u0580\u0565\u0584 \u0574\u056b\u056c\u056b\u0578\u0576 \u0564\u0580\u0561\u0574", "$500" \u2192 "\u0570\u056b\u0576\u0563 \u0570\u0561\u0580\u0575\u0578\u0582\u0580 \u0564\u0578\u056c\u0561\u0580"
-- Decimals: "10.5%" \u2192 "\u057f\u0561\u057d \u0561\u0574\u0562\u0578\u0572\u057b \u056f\u0565\u057d \u057f\u0578\u056f\u0578\u057d", "18.42%" \u2192 "\u057f\u0561\u057d\u0576\u0578\u0582\u0569 \u0561\u0574\u0562\u0578\u0572\u057b \u0584\u0561\u057c\u0561\u057d\u0578\u0582\u0576\u0565\u0580\u056f\u0578\u0582 \u057f\u0578\u056f\u0578\u057d"
-- Ranges: "5-10" \u2192 "\u0570\u056b\u0576\u0563\u056b\u0581 \u057f\u0561\u057d", "18.42-22.79%" \u2192 "\u057f\u0561\u057d\u0576\u0578\u0582\u0569 \u0561\u0574\u0562\u0578\u0572\u057b \u0584\u0561\u057c\u0561\u057d\u0578\u0582\u0576\u0565\u0580\u056f\u0578\u0582\u056b\u0581 \u0584\u057d\u0561\u0576\u0565\u0580\u056f\u0578\u0582 \u0561\u0574\u0562\u0578\u0572\u057b \u0575\u0578\u0569\u0561\u0576\u0561\u057d\u0578\u0582\u0576\u056b\u0576\u0576 \u057f\u0578\u056f\u0578\u057d"
-- Abbreviations: common Armenian banking abbreviations to full words
-- IMPORTANT: For complex decimal ranges like "18.42-22.79%", break into simple parts: spell out each number fully in Armenian words, use "\u056b\u0581" for the dash/range, and "\u057f\u0578\u056f\u0578\u057d" for %
+_ARM_ONES = {
+    0: "\u0566\u0580\u0578", 1: "\u0574\u0565\u056f", 2: "\u0565\u0580\u056f\u0578\u0582", 3: "\u0565\u0580\u0565\u0584",
+    4: "\u0579\u0578\u0580\u057d", 5: "\u0570\u056b\u0576\u0563", 6: "\u057e\u0565\u0581", 7: "\u0575\u0578\u0569",
+    8: "\u0578\u0582\u0569", 9: "\u056b\u0576\u0576",
+}
+_ARM_TEENS = {
+    10: "\u057f\u0561\u057d", 11: "\u057f\u0561\u057d\u0576\u0574\u0565\u056f", 12: "\u057f\u0561\u057d\u0576\u0565\u0580\u056f\u0578\u0582",
+    13: "\u057f\u0561\u057d\u0576\u0565\u0580\u0565\u0584", 14: "\u057f\u0561\u057d\u0576\u0579\u0578\u0580\u057d",
+    15: "\u057f\u0561\u057d\u0576\u0570\u056b\u0576\u0563", 16: "\u057f\u0561\u057d\u0576\u057e\u0565\u0581",
+    17: "\u057f\u0561\u057d\u0576\u0575\u0578\u0569", 18: "\u057f\u0561\u057d\u0576\u0578\u0582\u0569",
+    19: "\u057f\u0561\u057d\u0576\u056b\u0576\u0576",
+}
+_ARM_TENS = {
+    20: "\u0584\u057d\u0561\u0576", 30: "\u0565\u0580\u0565\u057d\u0578\u0582\u0576", 40: "\u0584\u0561\u057c\u0561\u057d\u0578\u0582\u0576",
+    50: "\u0570\u056b\u057d\u0578\u0582\u0576", 60: "\u057e\u0561\u0569\u057d\u0578\u0582\u0576", 70: "\u0575\u0578\u0569\u0561\u0576\u0561\u057d\u0578\u0582\u0576",
+    80: "\u0578\u0582\u0569\u057d\u0578\u0582\u0576", 90: "\u056b\u0576\u0576\u057d\u0578\u0582\u0576",
+}
 
-Rules:
-- Return ONLY the normalized Armenian text
-- Keep all non-numeric Armenian text EXACTLY unchanged
-- Do NOT add explanations
-- Do NOT remove or rephrase any Armenian words"""
+
+def _number_to_armenian(n: int) -> str:
+    """Convert a non-negative integer to Armenian cardinal words."""
+    if n < 0:
+        return "\u0574\u056b\u0576\u0578\u0582\u057d " + _number_to_armenian(-n)
+    if n <= 9:
+        return _ARM_ONES[n]
+    if n <= 19:
+        return _ARM_TEENS[n]
+    if n <= 99:
+        tens, ones = divmod(n, 10)
+        result = _ARM_TENS[tens * 10]
+        if ones:
+            result += " " + _ARM_ONES[ones]
+        return result
+    if n <= 999:
+        hundreds, remainder = divmod(n, 100)
+        result = ""
+        if hundreds == 1:
+            result = "\u0570\u0561\u0580\u0575\u0578\u0582\u0580"
+        else:
+            result = _ARM_ONES[hundreds] + " \u0570\u0561\u0580\u0575\u0578\u0582\u0580"
+        if remainder:
+            result += " " + _number_to_armenian(remainder)
+        return result
+    if n <= 999_999:
+        thousands, remainder = divmod(n, 1000)
+        result = ""
+        if thousands == 1:
+            result = "\u0570\u0561\u0566\u0561\u0580"
+        else:
+            result = _number_to_armenian(thousands) + " \u0570\u0561\u0566\u0561\u0580"
+        if remainder:
+            result += " " + _number_to_armenian(remainder)
+        return result
+    if n <= 999_999_999:
+        millions, remainder = divmod(n, 1_000_000)
+        result = ""
+        if millions == 1:
+            result = "\u0574\u0565\u056f \u0574\u056b\u056c\u056b\u0578\u0576"
+        else:
+            result = _number_to_armenian(millions) + " \u0574\u056b\u056c\u056b\u0578\u0576"
+        if remainder:
+            result += " " + _number_to_armenian(remainder)
+        return result
+    if n <= 999_999_999_999:
+        billions, remainder = divmod(n, 1_000_000_000)
+        result = ""
+        if billions == 1:
+            result = "\u0574\u0565\u056f \u0574\u056b\u056c\u056b\u0561\u0580\u0564"
+        else:
+            result = _number_to_armenian(billions) + " \u0574\u056b\u056c\u056b\u0561\u0580\u0564"
+        if remainder:
+            result += " " + _number_to_armenian(remainder)
+        return result
+    return str(n)
+
+
+def _decimal_to_armenian(integer_part: str, fractional_part: str) -> str:
+    """Convert a decimal like '19.98' to Armenian words: 'տասնինն ամբողջ իննdelays ут'."""
+    int_val = int(integer_part)
+    frac_val = int(fractional_part)
+    return _number_to_armenian(int_val) + " \u0561\u0574\u0562\u0578\u0572\u057b " + _number_to_armenian(frac_val)
+
+
+def _normalize_numbers_armenian(text: str) -> str:
+    """Replace all numbers/percentages/currency/ranges in text with Armenian words."""
+
+    def _clean_int(s: str) -> int:
+        return int(s.replace(",", "").replace(" ", ""))
+
+    # 1. Decimal ranges with %: "18.42-22.79%"
+    def _range_decimal_pct(m):
+        a_int, a_frac, b_int, b_frac = m.group(1), m.group(2), m.group(3), m.group(4)
+        return (_decimal_to_armenian(a_int, a_frac) + "\u056b\u0581 " +
+                _decimal_to_armenian(b_int, b_frac) + " \u057f\u0578\u056f\u0578\u057d")
+    text = re.sub(r"(\d+)[.,](\d+)\s*-\s*(\d+)[.,](\d+)\s*%", _range_decimal_pct, text)
+
+    # 2. Integer ranges with %: "5-10%"
+    def _range_int_pct(m):
+        a, b = _clean_int(m.group(1)), _clean_int(m.group(2))
+        return _number_to_armenian(a) + "\u056b\u0581 " + _number_to_armenian(b) + " \u057f\u0578\u056f\u0578\u057d"
+    text = re.sub(r"(\d[\d,]*)\s*-\s*(\d[\d,]*)\s*%", _range_int_pct, text)
+
+    # 3. Decimal with %: "10.5%"
+    def _decimal_pct(m):
+        return _decimal_to_armenian(m.group(1), m.group(2)) + " \u057f\u0578\u056f\u0578\u057d"
+    text = re.sub(r"(\d+)[.,](\d+)\s*%", _decimal_pct, text)
+
+    # 4. Integer with %: "15%"
+    def _int_pct(m):
+        return _number_to_armenian(_clean_int(m.group(1))) + " \u057f\u0578\u056f\u0578\u057d"
+    text = re.sub(r"(\d[\d,]*)\s*%", _int_pct, text)
+
+    # 5. Currency AMD
+    def _currency_amd(m):
+        return _number_to_armenian(_clean_int(m.group(1))) + " \u0564\u0580\u0561\u0574"
+    text = re.sub(r"([\d,]+)\s*(?:AMD|\u0564\u0580\u0561\u0574)", _currency_amd, text)
+
+    # 6. Currency $
+    def _currency_usd(m):
+        return _number_to_armenian(_clean_int(m.group(1))) + " \u0564\u0578\u056c\u0561\u0580"
+    text = re.sub(r"\$\s*([\d,]+)", _currency_usd, text)
+
+    # 7. Plain decimals: "19.98"
+    def _decimal(m):
+        return _decimal_to_armenian(m.group(1), m.group(2))
+    text = re.sub(r"(\d+)[.,](\d+)", _decimal, text)
+
+    # 8. Integer ranges: "5-10"
+    def _range_int(m):
+        a, b = _clean_int(m.group(1)), _clean_int(m.group(2))
+        return _number_to_armenian(a) + "\u056b\u0581 " + _number_to_armenian(b)
+    text = re.sub(r"(\d[\d,]*)\s*-\s*(\d[\d,]*)", _range_int, text)
+
+    # 9. Plain integers: "500"
+    def _plain_int(m):
+        return _number_to_armenian(_clean_int(m.group(0)))
+    text = re.sub(r"\d[\d,]*", _plain_int, text)
+
+    return text
 
 
 # ─── STT Post-Processor (cleans up Whisper output via LLM) ────────────
@@ -124,74 +247,41 @@ class STTPostProcessor:
             return raw_text
 
 
-# ─── MMS-TTS Helper (Facebook/Meta Armenian) ─────────────────────────
+# ─── OpenAI TTS Helper ────────────────────────────────────────────────
 
-class MMSTTSHelper:
-    """Synthesizes Armenian speech using Facebook MMS-TTS (VITS model).
-    Normalizes numbers/symbols to Armenian words via LLM before synthesis.
-    Synthesizes sentence-by-sentence with silence gaps for natural pauses."""
+class OpenAITTSHelper:
+    """Synthesizes Armenian speech using OpenAI TTS API.
+    Normalizes numbers/symbols to Armenian words deterministically before synthesis."""
 
     def __init__(self):
-        logger.info(f"Loading MMS-TTS model: {MMS_MODEL_NAME} ...")
-        self._model = VitsModel.from_pretrained(MMS_MODEL_NAME)
-        self._tokenizer = AutoTokenizer.from_pretrained(MMS_MODEL_NAME)
-        self._sample_rate = self._model.config.sampling_rate
-        self._groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        logger.info(f"MMS-TTS initialized (sr={self._sample_rate})")
+        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._sample_rate = OPENAI_TTS_SAMPLE_RATE
+        logger.info(f"OpenAI TTS initialized (model={OPENAI_TTS_MODEL}, voice={OPENAI_TTS_VOICE})")
 
     @property
     def sample_rate(self) -> int:
         return self._sample_rate
 
-    async def _normalize_for_tts(self, text: str) -> str:
-        """Use Llama to convert numbers/symbols to Armenian words for TTS."""
+    def _normalize_for_tts(self, text: str) -> str:
+        """Convert numbers/symbols to Armenian words for TTS (deterministic, no LLM)."""
         if not re.search(r"\d", text):
             return text
-        try:
-            response = await self._groq.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": TTS_NORMALIZER_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.0,
-                max_tokens=len(text) * 3,
-            )
-            normalized = response.choices[0].message.content.strip()
-            if normalized:
-                logger.info(f"TTS normalized: numbers converted to words")
-                return normalized
-        except Exception as e:
-            logger.warning(f"TTS normalization failed, using raw text: {e}")
-        return text
-
-    def _synthesize_sentence_sync(self, text: str) -> np.ndarray:
-        """Synthesize a single sentence to int16 PCM numpy array."""
-        inputs = self._tokenizer(text, return_tensors="pt")
-        with torch.no_grad():
-            output = self._model(**inputs).waveform  # shape: (1, num_samples)
-        # Convert float32 waveform to int16 PCM
-        audio_np = output.squeeze(0).numpy()
-        pcm_int16 = (audio_np * 32767).astype(np.int16)
-        return pcm_int16
-
-    def _synthesize_sync(self, text: str) -> bytes:
-        """Synthesize full text in one pass for speed."""
-        try:
-            pcm = self._synthesize_sentence_sync(text)
-            return pcm.tobytes()
-        except Exception as e:
-            logger.warning(f"TTS synthesis failed: {e}")
-            return np.zeros(0, dtype=np.int16).tobytes()
+        normalized = _normalize_numbers_armenian(text)
+        if normalized != text:
+            logger.info(f"TTS normalized: '{text}' -> '{normalized}'")
+        return normalized
 
     async def synthesize(self, text: str) -> rtc.AudioFrame:
         """Normalize text and synthesize to an AudioFrame."""
-        text = await self._normalize_for_tts(text)
-        loop = asyncio.get_event_loop()
-        pcm_bytes = await loop.run_in_executor(
-            None, functools.partial(self._synthesize_sync, text),
+        text = self._normalize_for_tts(text)
+        response = await self._client.audio.speech.create(
+            model=OPENAI_TTS_MODEL,
+            voice=OPENAI_TTS_VOICE,
+            input=text,
+            response_format="pcm",
         )
-        samples_per_channel = len(pcm_bytes) // 2  # int16 = 2 bytes per sample
+        pcm_bytes = response.content
+        samples_per_channel = len(pcm_bytes) // 2
         return rtc.AudioFrame(
             data=pcm_bytes,
             sample_rate=self._sample_rate,
@@ -286,7 +376,7 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize Groq Whisper STT, post-processor, RAG, and TTS
     whisper_stt = GroqWhisperSTT()
     post_processor = STTPostProcessor()
-    tts_helper = MMSTTSHelper()
+    tts_helper = OpenAITTSHelper()
 
     from rag import BankRAG
     rag = BankRAG()
