@@ -42,6 +42,34 @@ OPENAI_TTS_MODEL = "tts-1"
 OPENAI_TTS_VOICE = "nova"
 OPENAI_TTS_SAMPLE_RATE = 24000
 
+# Whisper prompt: natural Armenian banking text to bias recognition toward domain vocabulary.
+# Acts as fake "previous transcript context" — NOT instructions.
+WHISPER_PROMPT = (
+    "\u0535\u057d \u0578\u0582\u0566\u0578\u0582\u0574 \u0565\u0574 \u056b\u0574\u0561\u0576\u0561\u056c "
+    "\u057e\u0561\u0580\u056f\u056b \u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584\u056b "
+    "\u0574\u0561\u057d\u056b\u0576\u0589 "
+    "\u053b\u0576\u0571 \u0561\u057e\u0561\u0576\u0564\u0576\u0565\u0580 \u0578\u0582\u0576\u0565\u0584 "
+    "\u0531\u0574\u0565\u0580\u056b\u0561\u0562\u0561\u0576\u056f\u0578\u0582\u0574\u0589 "
+    "\u053f\u0561\u0580\u0578\u0572 \u0565\u0584 \u0561\u057d\u0565\u056c \u056b\u0576\u0579 "
+    "\u057e\u0561\u0580\u056f\u0565\u0580 \u0565\u0576 \u0561\u057c\u0561\u057b\u0561\u0580\u056f\u057e\u0578\u0582\u0574, "
+    "\u056b\u0576\u0579 \u0561\u0574\u057d\u0561\u056f\u0561\u0576 \u057e\u0573\u0561\u0580 \u0567, "
+    "\u056b\u0576\u0579 \u0570\u056b\u057a\u0578\u0569\u0565\u056f\u0561\u0575\u056b\u0576 \u057e\u0561\u0580\u056f\u056b "
+    "\u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584\u0576 \u0567\u0589 "
+    "\u054d\u057a\u0561\u057c\u0578\u0572\u0561\u056f\u0561\u0576 \u057e\u0561\u0580\u056f\u056b "
+    "\u0570\u0561\u0577\u056b\u057e\u0568 \u0562\u0561\u0576\u056f\u0578\u0582\u0574 "
+    "\u0562\u0561\u0581\u0565\u056c\u0578\u0582 \u0570\u0561\u0574\u0561\u0580 "
+    "\u057a\u0565\u057f\u0584 \u0567 \u0562\u0565\u0580\u0565\u0584 \u0584\u0561\u0580\u057f\u0568 "
+    "\u0587 \u0583\u0578\u056d\u0561\u0576\u0581\u0578\u0582\u0574\u0568\u0589 "
+    "\u0535\u057e\u0578\u056f\u0561\u0562\u0561\u0576\u056f\u056b \u0574\u0561\u057d\u0576\u0561\u0573\u0575\u0578\u0582\u0572\u0576\u0565\u0580\u0568 "
+    "\u0561\u0577\u056d\u0561\u057f\u0578\u0582\u0574 \u0565\u0576 \u0535\u0580\u0587\u0561\u0576\u0578\u0582\u0574\u0589 "
+    "\u0531\u0580\u0564\u0577\u056b\u0576\u0562\u0561\u0576\u056f\u0568 \u0561\u057c\u0561\u057b\u0561\u0580\u056f\u0578\u0582\u0574 \u0567 "
+    "\u0561\u057e\u0561\u0576\u0564\u0576\u0565\u0580 \u0562\u0561\u0580\u0571\u0580 "
+    "\u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584\u0576\u0565\u0580\u0578\u057e\u0589 "
+    "\u053b\u0576\u0565\u056f\u0578\u0562\u0561\u0576\u056f\u0578\u0582\u0574 \u056f\u0561\u0580\u0578\u0572 \u0565\u0584 "
+    "\u057e\u0573\u0561\u0580\u0578\u0582\u0574 \u056f\u0561\u057f\u0561\u0580\u0565\u056c \u0564\u0580\u0561\u0574\u0578\u057e "
+    "\u056f\u0561\u0574 \u0564\u0578\u056c\u0561\u0580\u0578\u057e\u0589"
+)
+
 POST_PROCESSOR_SYSTEM_PROMPT = """\
 You are an Armenian text post-processor for a banking voice assistant STT system.
 Your job is to take raw speech-to-text output and return corrected Armenian text.
@@ -67,7 +95,21 @@ Rules:
 - Do NOT add extra words or sentences the speaker did not say
 - Do NOT explain your changes
 - If the input is already clean, return it unchanged
-- If the input is just noise or silence artifacts (e.g. 'Subtitle', 'Thank you', repeated single characters), return exactly: NOISE"""
+- If the input is just noise or silence artifacts (e.g. 'Subtitle', 'Thank you', repeated single characters), return exactly: NOISE
+
+Examples:
+
+Input: \u0535\u057d \u0578\u0582\u0566\u0578\u0582\u0574 \u0565\u0574 \u056b\u0574\u0561\u0576\u0561\u056c \u057e\u0561\u0580\u056f\u056b \u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584\u0568, \u056b\u0576\u0571 \u057a\u0561\u0575\u0574\u0561\u0576\u0576\u0565\u0580 \u0578\u0582\u0576\u0565\u0584 \u0561\u0574\u0565\u0580\u056b\u0561 \u0562\u0561\u0576\u056f\u0578\u0582\u0574
+Output: \u0535\u057d \u0578\u0582\u0566\u0578\u0582\u0574 \u0565\u0574 \u056b\u0574\u0561\u0576\u0561\u056c \u057e\u0561\u0580\u056f\u056b \u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584\u0568, \u056b\u0576\u0571 \u057a\u0561\u0575\u0574\u0561\u0576\u0576\u0565\u0580 \u0578\u0582\u0576\u0565\u0584 \u0531\u0574\u0565\u0580\u056b\u0561\u0562\u0561\u0576\u056f\u0578\u0582\u0574\u0589
+
+Input: \u053b\u0576\u0571 \u057e\u0561\u0580\u056f \u0565\u0574 \u0578\u0582\u0566\u0578\u0582\u0574 \u057e\u0561\u0580\u056f \u0565\u0574 \u0578\u0582\u0566\u0578\u0582\u0574 \u057e\u0561\u0580\u056f \u0565\u0574 \u0578\u0582\u0566\u0578\u0582\u0574 \u057e\u0561\u0580\u056f \u0565\u0574 \u0578\u0582\u0566\u0578\u0582\u0574
+Output: \u053b\u0576\u0571 \u057e\u0561\u0580\u056f \u0565\u0574 \u0578\u0582\u0566\u0578\u0582\u0574\u0589
+
+Input: \u053f\u0561\u0580\u0578\u0572 \u0567 kart-\u0568 \u057a\u0561\u057f\u057e\u056b\u0580\u0565\u056c bank-\u0578\u0582\u0574
+Output: \u053f\u0561\u0580\u0578\u0572 \u0567 \u0584\u0561\u0580\u057f\u0568 \u057a\u0561\u057f\u057e\u056b\u0580\u0565\u056c \u0562\u0561\u0576\u056f\u0578\u0582\u0574\u0589
+
+Input: Subtitle. Thank you for watching.
+Output: NOISE"""
 
 # ─── Deterministic Armenian number-to-words converter ─────────────────
 
@@ -215,20 +257,20 @@ def _normalize_numbers_armenian(text: str) -> str:
 # ─── STT Post-Processor (cleans up Whisper output via LLM) ────────────
 
 class STTPostProcessor:
-    """Uses Groq Llama to clean up raw Whisper transcriptions."""
+    """Uses OpenAI GPT-4o-mini to clean up raw Whisper transcriptions."""
 
     def __init__(self):
-        self._client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        logger.info("STT Post-Processor initialized (Groq Llama).")
+        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        logger.info("STT Post-Processor initialized (OpenAI GPT-4o-mini).")
 
     async def process(self, raw_text: str) -> str:
-        """Clean up raw STT text using Llama."""
+        """Clean up raw STT text using GPT-4o-mini."""
         if not raw_text.strip():
             return ""
 
         try:
             response = await self._client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": POST_PROCESSOR_SYSTEM_PROMPT},
                     {"role": "user", "content": raw_text},
@@ -347,6 +389,8 @@ class GroqWhisperSTT(stt.STT):
             model="whisper-large-v3",
             language=lang,
             response_format="verbose_json",
+            prompt=WHISPER_PROMPT,
+            temperature=0.0,
         )
 
         full_text = transcription.text.strip() if transcription.text else ""
