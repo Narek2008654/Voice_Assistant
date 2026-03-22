@@ -158,11 +158,39 @@ class SileroTTSHelper:
             logger.warning(f"TTS normalization failed, using raw text: {e}")
         return text
 
+    @staticmethod
+    def _prepare_ssml(text: str) -> str:
+        """Convert plain text to SSML with natural pauses."""
+        # Split on sentence boundaries: Armenian ։, period, !, ?
+        sentences = re.split(r'(?<=[։\.!\?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        if not sentences:
+            return f"<speak>{text}</speak>"
+
+        # Add short pauses after commas within each sentence
+        parts = []
+        for i, sentence in enumerate(sentences):
+            sentence = sentence.replace(",", ',<break time="150ms"/>')
+            sentence = sentence.replace("՝", '՝<break time="150ms"/>')  # Armenian comma
+            parts.append(f"<s>{sentence}</s>")
+            if i < len(sentences) - 1:
+                parts.append('<break time="350ms"/>')
+
+        return "<speak>" + "".join(parts) + "</speak>"
+
     def _synthesize_sync(self, text: str) -> bytes:
         """Run TTS inference (CPU-bound, call from executor)."""
-        audio_tensor = self._model.apply_tts(
-            text=text, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
-        )
+        try:
+            ssml = self._prepare_ssml(text)
+            audio_tensor = self._model.apply_tts(
+                ssml_text=ssml, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
+            )
+        except Exception as e:
+            logger.warning(f"SSML synthesis failed, falling back to plain text: {e}")
+            audio_tensor = self._model.apply_tts(
+                text=text, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
+            )
         pcm_int16 = (audio_tensor.numpy() * 32767).astype(np.int16)
         return pcm_int16.tobytes()
 
