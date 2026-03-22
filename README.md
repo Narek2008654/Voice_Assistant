@@ -15,7 +15,7 @@ An end-to-end Voice AI customer support agent for Armenian banks, built on the o
 
 ```
 Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
-    → Llama 3.1 8B Post-Processor (fix Armenian typos)
+    → GPT-4o-mini Post-Processor (fix Armenian typos)
     → ChromaDB Semantic Retrieval → Llama 3.3 70B (Answer Generation)
     → Armenian Number Normalizer → OpenAI TTS (Speech Output)
 ```
@@ -27,7 +27,7 @@ Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
 | **Real-time audio** | LiveKit Agents (open-source) | Low-latency WebRTC framework with built-in agent SDK, VAD integration, and room management |
 | **Voice Activity Detection** | Silero VAD | Lightweight, accurate speech boundary detection that works well with streaming audio |
 | **Speech-to-Text** | Groq Whisper large-v3 | Free hosted API, fast inference, supports Armenian (`hy`) language natively |
-| **STT Post-Processing** | Groq Llama 3.1 8B Instant | Corrects Armenian spelling/grammar errors from Whisper output; 8B model is fast enough for real-time correction |
+| **STT Post-Processing** | OpenAI GPT-4o-mini | Corrects Armenian spelling/grammar errors from Whisper output; strong multilingual understanding with few-shot examples for banking domain |
 | **Retrieval** | ChromaDB + `paraphrase-multilingual-MiniLM-L12-v2` | Vector database with multilingual sentence embeddings for semantic search over Armenian bank data; persisted locally for fast startup |
 | **Answer Generation** | Groq Llama 3.3 70B Versatile | Strongest open model on Groq for generating accurate Armenian answers from retrieved context |
 | **Number Normalization** | Deterministic Python converter | Converts numbers, percentages, decimals, currency, and ranges to Armenian cardinal words before TTS |
@@ -49,16 +49,16 @@ Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
 
 ---
 
-#### STT Post-Processing: Groq Llama 3.1 8B Instant
+#### STT Post-Processing: OpenAI GPT-4o-mini
 
-| | Llama 3.1 8B (chosen) | GPT-4o-mini | Claude Haiku | No post-processing |
+| | GPT-4o-mini (chosen) | Llama 3.1 8B (Groq) | Claude Haiku | No post-processing |
 |---|---|---|---|---|
-| **Armenian understanding** | Basic but sufficient for typo correction | Better Armenian, higher accuracy | Good multilingual | N/A |
-| **Cost** | Free on Groq | $0.15/1M input tokens | $0.25/1M input tokens | Free |
-| **Latency** | ~100-200ms (Groq LPU) | ~300-500ms | ~300-500ms | 0ms |
-| **Purpose fit** | Fast enough for real-time typo fixing | Overkill for simple corrections | Overkill for simple corrections | Whisper errors pass through |
+| **Armenian understanding** | Strong multilingual, high accuracy | Basic — often misses subtle errors | Good multilingual | N/A |
+| **Cost** | $0.15/1M input tokens | Free on Groq | $0.25/1M input tokens | Free |
+| **Latency** | ~300-500ms | ~100-200ms (Groq LPU) | ~300-500ms | 0ms |
+| **Purpose fit** | Best accuracy for Armenian typo correction | Fast but weak on Armenian edge cases | Similar quality, higher cost | Whisper errors pass through |
 
-**Why Llama 8B on Groq**: The post-processor's job is simple — fix Armenian spelling mistakes, remove Whisper hallucinations (repeated words), filter noise. The 8B model handles this adequately at ~100ms, keeping the pipeline real-time. GPT-4o-mini or Claude Haiku would be more accurate but add latency and cost for a task that doesn't need their full capability. Skipping post-processing entirely was tested but Whisper's Armenian errors degraded RAG retrieval quality.
+**Why GPT-4o-mini**: The post-processor fixes Armenian spelling, removes Whisper hallucinations, and corrects misheard banking terms. Llama 3.1 8B on Groq was the original choice (free, fast) but its Armenian understanding was too weak — it missed subtle errors and sometimes introduced new ones. GPT-4o-mini handles Armenian significantly better, and the cost is negligible ($0.15/1M tokens — a typical correction is ~50 tokens). Claude Haiku is comparable quality but more expensive. Skipping post-processing entirely was tested but Whisper's Armenian errors degraded RAG retrieval quality.
 
 ---
 
@@ -230,7 +230,7 @@ Open the printed Meet URL in your browser to join the room with your microphone.
 1. **Audio capture**: LiveKit streams microphone audio from the browser to the agent via WebRTC
 2. **VAD**: Silero VAD detects speech start/end boundaries in the audio stream
 3. **Transcription**: Complete speech segments are sent to Groq's Whisper API for Armenian transcription
-4. **Post-processing**: Raw transcription is cleaned by Llama 8B (fixes Armenian spelling, removes Whisper artifacts)
+4. **Post-processing**: Raw transcription is cleaned by GPT-4o-mini (fixes Armenian spelling, removes Whisper artifacts, corrects misheard banking terms)
 5. **Retrieval**: ChromaDB performs cosine similarity search over multilingual embeddings of chunked bank data
 6. **Answer generation**: Top-K relevant chunks are passed as context to Llama 70B, which generates a grounded Armenian answer
 7. **Number normalization**: All numbers, percentages, decimals, and currency in the answer are converted to Armenian cardinal words
