@@ -17,6 +17,7 @@ An end-to-end Voice AI customer support agent for Armenian banks, built on the o
 Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
     → Llama 3.1 8B Post-Processor (fix Armenian typos)
     → ChromaDB Semantic Retrieval → Llama 3.3 70B (Answer Generation)
+    → Armenian Number Normalizer → OpenAI TTS (Speech Output)
 ```
 
 ### Components
@@ -29,6 +30,8 @@ Microphone → LiveKit Room → Silero VAD → Groq Whisper (STT)
 | **STT Post-Processing** | Groq Llama 3.1 8B Instant | Corrects Armenian spelling/grammar errors from Whisper output; 8B model is fast enough for real-time correction |
 | **Retrieval** | ChromaDB + `paraphrase-multilingual-MiniLM-L12-v2` | Vector database with multilingual sentence embeddings for semantic search over Armenian bank data; persisted locally for fast startup |
 | **Answer Generation** | Groq Llama 3.3 70B Versatile | Strongest open model on Groq for generating accurate Armenian answers from retrieved context |
+| **Number Normalization** | Deterministic Python converter | Converts numbers, percentages, decimals, currency, and ranges to Armenian cardinal words before TTS |
+| **Text-to-Speech** | OpenAI TTS (`tts-1`, voice: `nova`) | High-quality speech synthesis; raw PCM output streamed in real-time chunks over WebRTC |
 | **Web Scraping** | Requests + BeautifulSoup, Selenium | Bank-specific strategies: static HTML for Evocabank, headless Chrome for JS-rendered sites (Ameriabank, Inecobank), REST API extraction for Ardshinbank |
 
 ### Design Decisions
@@ -46,7 +49,7 @@ Voice_Agent/
 ├── banks_config.py     # Bank URLs and scraping methods (edit this to add banks)
 ├── scraper.py          # Generic scraping engine (driven by banks_config.py)
 ├── rag.py              # ChromaDB vector retrieval + Llama answer generation
-├── stt_agent.py        # Main LiveKit agent — STT pipeline + RAG integration
+├── stt_agent.py        # Main LiveKit agent — STT, post-processing, number normalization, TTS
 ├── generate_token.py   # LiveKit room token generator for testing
 ├── requirements.txt    # Python dependencies
 ├── data/
@@ -66,7 +69,7 @@ Voice_Agent/
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/<your-username>/Voice_Assistant.git
+git clone https://github.com/Narek2008654/Voice_Assistant.git
 cd Voice_Assistant
 pip install -r requirements.txt
 ```
@@ -76,13 +79,18 @@ pip install -r requirements.txt
 Create `.env.local` in the project root:
 
 ```env
-LIVEKIT_URL=wss://your-livekit-server.example.com
+LIVEKIT_URL=wss://your-livekit-server.livekit.cloud
 LIVEKIT_API_KEY=your_api_key
 LIVEKIT_API_SECRET=your_api_secret
 GROQ_API_KEY=your_groq_api_key
+OPENAI_API_KEY=your_openai_api_key
 ```
 
-Get a free Groq API key at [console.groq.com](https://console.groq.com).
+| Key | Where to get it |
+|-----|----------------|
+| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | [LiveKit Cloud Dashboard](https://cloud.livekit.io) |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) (free tier) |
+| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) |
 
 ### 3. Scrape bank data
 
@@ -118,6 +126,8 @@ Open the printed Meet URL in your browser to join the room with your microphone.
 4. **Post-processing**: Raw transcription is cleaned by Llama 8B (fixes Armenian spelling, removes Whisper artifacts)
 5. **Retrieval**: ChromaDB performs cosine similarity search over multilingual embeddings of chunked bank data
 6. **Answer generation**: Top-K relevant chunks are passed as context to Llama 70B, which generates a grounded Armenian answer
+7. **Number normalization**: All numbers, percentages, decimals, and currency in the answer are converted to Armenian cardinal words
+8. **Speech synthesis**: The normalized text is sent to OpenAI TTS, and the resulting audio is streamed back to the user in real-time chunks
 
 ## Scalability
 
