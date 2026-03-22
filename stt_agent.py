@@ -2,7 +2,7 @@
 LiveKit STT Agent using Groq's Whisper API (free, fast).
 Joins a LiveKit room, listens to participant audio, and transcribes Armenian speech.
 Post-processes transcriptions with Llama to fix typos, inaccuracies, and grammar.
-Speaks answers back via Silero TTS (Armenian voice).
+Speaks answers back via Facebook MMS-TTS (Armenian voice).
 
 Usage:
     python stt_agent.py connect --room test-room   # Connect directly to a room
@@ -26,7 +26,7 @@ from livekit import agents, rtc
 from livekit.agents import stt
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions, NotGivenOr
 from livekit.plugins.silero import VAD
-from silero import silero_tts
+from transformers import VitsModel, AutoTokenizer
 
 from pathlib import Path
 load_dotenv(Path(__file__).parent / ".env.local")
@@ -39,9 +39,8 @@ logger = logging.getLogger("stt-agent")
 WHISPER_LANGUAGE = "hy"  # Armenian
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
-TTS_SAMPLE_RATE = 48000
-TTS_SPEAKER = "hye_zara"
 TTS_CHUNK_MS = 50
+MMS_MODEL_NAME = "facebook/mms-tts-hyw"
 
 POST_PROCESSOR_SYSTEM_PROMPT = """\
 You are an Armenian text post-processor for a banking voice assistant STT system.
@@ -125,16 +124,24 @@ class STTPostProcessor:
             return raw_text
 
 
-# ─── Silero TTS Helper ─────────────────────────────────────────────────
+# ─── MMS-TTS Helper (Facebook/Meta Armenian) ─────────────────────────
 
-class SileroTTSHelper:
-    """Synthesizes Armenian speech using Silero V5 CIS Base model.
-    Normalizes numbers/symbols to Armenian words via LLM before synthesis."""
+class MMSTTSHelper:
+    """Synthesizes Armenian speech using Facebook MMS-TTS (VITS model).
+    Normalizes numbers/symbols to Armenian words via LLM before synthesis.
+    Synthesizes sentence-by-sentence with silence gaps for natural pauses."""
 
     def __init__(self):
-        self._model, _ = silero_tts(language="ru", speaker="v5_cis_base")
+        logger.info(f"Loading MMS-TTS model: {MMS_MODEL_NAME} ...")
+        self._model = VitsModel.from_pretrained(MMS_MODEL_NAME)
+        self._tokenizer = AutoTokenizer.from_pretrained(MMS_MODEL_NAME)
+        self._sample_rate = self._model.config.sampling_rate
         self._groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        logger.info(f"Silero TTS initialized (speaker={TTS_SPEAKER}, sr={TTS_SAMPLE_RATE})")
+        logger.info(f"MMS-TTS initialized (sr={self._sample_rate})")
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
 
     async def _normalize_for_tts(self, text: str) -> str:
         """Use Llama to convert numbers/symbols to Armenian words for TTS."""
@@ -158,41 +165,24 @@ class SileroTTSHelper:
             logger.warning(f"TTS normalization failed, using raw text: {e}")
         return text
 
-    @staticmethod
-    def _prepare_ssml(text: str) -> str:
-        """Convert plain text to SSML with natural pauses."""
-        # Split on sentence boundaries: Armenian ։, period, !, ?
-        sentences = re.split(r'(?<=[։\.!\?])\s+', text.strip())
-        sentences = [s.strip() for s in sentences if s.strip()]
-
-        if not sentences:
-            return f"<speak>{text}</speak>"
-
-        # Add short pauses after commas within each sentence
-        parts = []
-        for i, sentence in enumerate(sentences):
-            sentence = sentence.replace(",", ',<break time="150ms"/>')
-            sentence = sentence.replace("՝", '՝<break time="150ms"/>')  # Armenian comma
-            parts.append(f"<s>{sentence}</s>")
-            if i < len(sentences) - 1:
-                parts.append('<break time="350ms"/>')
-
-        return "<speak>" + "".join(parts) + "</speak>"
+    def _synthesize_sentence_sync(self, text: str) -> np.ndarray:
+        """Synthesize a single sentence to int16 PCM numpy array."""
+        inputs = self._tokenizer(text, return_tensors="pt")
+        with torch.no_grad():
+            output = self._model(**inputs).waveform  # shape: (1, num_samples)
+        # Convert float32 waveform to int16 PCM
+        audio_np = output.squeeze(0).numpy()
+        pcm_int16 = (audio_np * 32767).astype(np.int16)
+        return pcm_int16
 
     def _synthesize_sync(self, text: str) -> bytes:
-        """Run TTS inference (CPU-bound, call from executor)."""
+        """Synthesize full text in one pass for speed."""
         try:
-            ssml = self._prepare_ssml(text)
-            audio_tensor = self._model.apply_tts(
-                ssml_text=ssml, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
-            )
+            pcm = self._synthesize_sentence_sync(text)
+            return pcm.tobytes()
         except Exception as e:
-            logger.warning(f"SSML synthesis failed, falling back to plain text: {e}")
-            audio_tensor = self._model.apply_tts(
-                text=text, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
-            )
-        pcm_int16 = (audio_tensor.numpy() * 32767).astype(np.int16)
-        return pcm_int16.tobytes()
+            logger.warning(f"TTS synthesis failed: {e}")
+            return np.zeros(0, dtype=np.int16).tobytes()
 
     async def synthesize(self, text: str) -> rtc.AudioFrame:
         """Normalize text and synthesize to an AudioFrame."""
@@ -204,7 +194,7 @@ class SileroTTSHelper:
         samples_per_channel = len(pcm_bytes) // 2  # int16 = 2 bytes per sample
         return rtc.AudioFrame(
             data=pcm_bytes,
-            sample_rate=TTS_SAMPLE_RATE,
+            sample_rate=self._sample_rate,
             num_channels=NUM_CHANNELS,
             samples_per_channel=samples_per_channel,
         )
@@ -296,7 +286,7 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize Groq Whisper STT, post-processor, RAG, and TTS
     whisper_stt = GroqWhisperSTT()
     post_processor = STTPostProcessor()
-    tts_helper = SileroTTSHelper()
+    tts_helper = MMSTTSHelper()
 
     from rag import BankRAG
     rag = BankRAG()
@@ -311,7 +301,7 @@ async def entrypoint(ctx: agents.JobContext):
     streaming_stt = stt.StreamAdapter(stt=whisper_stt, vad=vad)
 
     # Publish an audio track so the agent can speak back
-    audio_source = rtc.AudioSource(TTS_SAMPLE_RATE, NUM_CHANNELS)
+    audio_source = rtc.AudioSource(tts_helper.sample_rate, NUM_CHANNELS)
     audio_track = rtc.LocalAudioTrack.create_audio_track("agent-voice", audio_source)
     publish_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
     await ctx.room.local_participant.publish_track(audio_track, publish_options)
@@ -356,7 +346,13 @@ async def entrypoint(ctx: agents.JobContext):
                     print(f"[BOT]  {answer}")
                     print(f"{'='*60}\n")
 
-                    # Step 3: Speak the answer via TTS
+                    # Step 3: Send answer as chat message in the room
+                    await ctx.room.local_participant.publish_data(
+                        answer.encode("utf-8"),
+                        topic="lk-chat-topic",
+                    )
+
+                    # Step 4: Speak the answer via TTS
                     try:
                         audio_frame = await tts_helper.synthesize(answer)
                         for chunk in _chunk_audio_frame(audio_frame):
