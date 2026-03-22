@@ -93,6 +93,9 @@ def _chunk_text(text: str, bank: str, category: str) -> list[dict]:
 
 # ─── RAG Engine ───────────────────────────────────────────────────────
 
+MAX_HISTORY_TURNS = 5  # Keep last N Q&A pairs for conversational memory
+
+
 class BankRAG:
     """Retrieval-Augmented Generation using ChromaDB + multilingual embeddings."""
 
@@ -107,6 +110,7 @@ class BankRAG:
             embedding_function=self._embedding_fn,
             metadata={"hnsw:space": "cosine"},
         )
+        self._history: list[dict] = []  # Conversation history [{role, content}, ...]
 
         # Index data if collection is empty
         if self._collection.count() == 0:
@@ -196,8 +200,12 @@ class BankRAG:
         )
         self._index_data()
 
+    def clear_history(self):
+        """Clear conversation history."""
+        self._history.clear()
+
     async def answer(self, question: str) -> str:
-        """Retrieve relevant context and generate an answer."""
+        """Retrieve relevant context and generate an answer with conversation memory."""
         chunks = self.retrieve(question)
 
         if not chunks:
@@ -209,17 +217,30 @@ class BankRAG:
 
         context = "\n\n---\n\n".join(context_parts)
 
+        # Build messages: system + conversation history + current question with context
+        messages = [{"role": "system", "content": ANSWER_SYSTEM_PROMPT}]
+        messages.extend(self._history)
+        messages.append({"role": "user", "content": f"\u053f\u0578\u0576\u057f\u0565\u0584\u057d\u057f\u055d\n{context}\n\n\u0540\u0561\u0580\u0581\u055d {question}"})
+
         try:
             response = await self._client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"\u053f\u0578\u0576\u057f\u0565\u0584\u057d\u057f\u055d\n{context}\n\n\u0540\u0561\u0580\u0581\u055d {question}"},
-                ],
+                messages=messages,
                 temperature=0.3,
                 max_tokens=700,
             )
-            return response.choices[0].message.content.strip()
+            answer_text = response.choices[0].message.content.strip()
+
+            # Save this turn to history (store question without context to save tokens)
+            self._history.append({"role": "user", "content": question})
+            self._history.append({"role": "assistant", "content": answer_text})
+
+            # Trim history to keep only the last N turns (each turn = 2 messages)
+            max_messages = MAX_HISTORY_TURNS * 2
+            if len(self._history) > max_messages:
+                self._history = self._history[-max_messages:]
+
+            return answer_text
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")
             return "\u0546\u0565\u0580\u0565\u0581\u0565\u0584, \u057d\u056d\u0561\u056c \u0561\u057c\u0561\u057b\u0561\u0581\u0561\u057e\u0589 \u053d\u0576\u0564\u0580\u0565\u0574 \u056f\u0580\u056f\u056b\u0576 \u0583\u0578\u0580\u0564\u0565\u0584:"
