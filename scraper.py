@@ -1,6 +1,7 @@
 """
 Generic web scraper for Armenian bank data.
-Driven entirely by banks_config.py — no bank-specific code here.
+Driven by banks_config.py — provide one root URL per category,
+sub-pages are discovered and crawled automatically.
 
 Supports three scraping methods:
   - "html"     : requests + BeautifulSoup (fast, for static pages)
@@ -14,6 +15,7 @@ import re
 import logging
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,11 +38,29 @@ HEADERS = {
 TIMEOUT = 30
 DELAY_BETWEEN_REQUESTS = 2
 OUTPUT_PATH = Path(__file__).parent / "data" / "bank_data.json"
+MAX_SUBPAGES = 25
 
 STRIP_TAGS = [
     "script", "style", "noscript", "iframe", "svg", "path",
     "meta", "link", "head",
 ]
+
+# Keywords to filter discovered links by category
+CATEGORY_LINK_KEYWORDS = {
+    "credits": [
+        "loan", "credit", "mortgage", "hipotek", "consumer", "overdraft",
+        "finance", "car-loan", "vark",
+    ],
+    "deposits": [
+        "deposit", "saving", "avand", "accumul", "flexible", "simple",
+        "account", "classical",
+    ],
+    "branches": [
+        "branch", "atm", "map", "contact", "locat",
+    ],
+}
+
+SKIP_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".doc", ".docx", ".xlsx", ".zip"}
 
 
 # ─── Text cleaning ───────────────────────────────────────────────────
@@ -107,6 +127,77 @@ def _dedup_lines(text: str) -> str:
     return "\n".join(deduped)
 
 
+# ─── Sub-page discovery ─────────────────────────────────────────────
+
+def _discover_subpages(html: str, root_url: str, category: str) -> list[str]:
+    """Auto-discover sub-page links from a root page.
+
+    Finds links that are:
+      - On the same domain
+      - Under the root URL path (sub-pages)
+      - OR anywhere on the domain matching category keywords (siblings)
+    Then filters all results by category keywords to keep only relevant pages.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    root_parsed = urlparse(root_url)
+    root_path = root_parsed.path.rstrip("/")
+    keywords = CATEGORY_LINK_KEYWORDS.get(category, [])
+
+    # Detect language prefix from root URL (e.g., /hy/, /en/, /ru/)
+    root_lang = None
+    lang_match = re.match(r"/(hy|en|ru|am)/", root_parsed.path)
+    if lang_match:
+        root_lang = lang_match.group(1)
+
+    candidates = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+
+        full_url = urljoin(root_url, href)
+        parsed = urlparse(full_url)
+
+        # Same domain only
+        if parsed.netloc != root_parsed.netloc:
+            continue
+
+        path = parsed.path.rstrip("/")
+        if not path or path == root_path:
+            continue
+
+        # Skip other language versions (e.g., /en/, /ru/ when root is /hy/)
+        if root_lang:
+            other_lang = re.match(r"/(hy|en|ru|am)/", path)
+            if other_lang and other_lang.group(1) != root_lang:
+                continue
+
+        # Skip file downloads
+        if any(path.endswith(ext) for ext in SKIP_EXTENSIONS):
+            continue
+
+        clean_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+
+        # Sub-page of root
+        if path.startswith(root_path + "/"):
+            candidates.add(clean_url)
+        # Or same-domain link matching category keywords
+        elif keywords and any(kw in path.lower() for kw in keywords):
+            candidates.add(clean_url)
+
+    # Filter all candidates by category keywords
+    if keywords and candidates:
+        filtered = {url for url in candidates
+                    if any(kw in urlparse(url).path.lower() for kw in keywords)}
+        if filtered:
+            return sorted(filtered)[:MAX_SUBPAGES]
+
+    # Fallback: return only direct sub-pages
+    sub_only = {url for url in candidates
+                if urlparse(url).path.startswith(root_path + "/")}
+    return sorted(sub_only)[:MAX_SUBPAGES]
+
+
 # ─── HTML scraping ───────────────────────────────────────────────────
 
 def _fetch_html(url: str) -> str | None:
@@ -122,17 +213,30 @@ def _fetch_html(url: str) -> str | None:
         return None
 
 
-def _scrape_html(urls: list[str]) -> list[dict]:
-    """Scrape pages with requests + BeautifulSoup."""
-    results = []
-    for url in urls:
-        html = _fetch_html(url)
-        if html:
-            text = _clean_html(html)
+def _scrape_html_with_discovery(root_url: str, category: str) -> list[dict]:
+    """Scrape root page + auto-discovered sub-pages via HTML."""
+    pages = []
+
+    html = _fetch_html(root_url)
+    if not html:
+        return pages
+
+    root_text = _clean_html(html)
+    if root_text.strip():
+        pages.append({"url": root_url, "text": root_text})
+
+    sub_urls = _discover_subpages(html, root_url, category)
+    logger.info(f"Discovered {len(sub_urls)} sub-pages from {root_url}")
+
+    for url in sub_urls:
+        sub_html = _fetch_html(url)
+        if sub_html:
+            text = _clean_html(sub_html)
             if text.strip():
-                results.append({"url": url, "text": text})
+                pages.append({"url": url, "text": text})
         time.sleep(DELAY_BETWEEN_REQUESTS)
-    return results
+
+    return pages
 
 
 # ─── Selenium scraping ───────────────────────────────────────────────
@@ -154,8 +258,8 @@ def _get_selenium_driver():
     return webdriver.Chrome(options=opts)
 
 
-def _scrape_selenium_page(url: str, wait_seconds: int = 10) -> str:
-    """Scrape a single JS-rendered page using Selenium."""
+def _scrape_selenium_page(url: str, wait_seconds: int = 10) -> tuple[str, str]:
+    """Scrape a single JS-rendered page. Returns (cleaned_text, page_source_html)."""
     driver = None
     try:
         driver = _get_selenium_driver()
@@ -177,9 +281,8 @@ def _scrape_selenium_page(url: str, wait_seconds: int = 10) -> str:
         cleaned_from_source = _clean_html(page_source, strip_nav_footer=True)
         cleaned_from_text = _clean_text(body_text)
 
-        if len(cleaned_from_source) > len(cleaned_from_text):
-            return cleaned_from_source
-        return cleaned_from_text
+        best_text = cleaned_from_source if len(cleaned_from_source) > len(cleaned_from_text) else cleaned_from_text
+        return best_text, page_source
 
     except Exception as e:
         logger.error(f"Selenium error for {url}: {e}")
@@ -188,18 +291,30 @@ def _scrape_selenium_page(url: str, wait_seconds: int = 10) -> str:
                 driver.quit()
             except Exception:
                 pass
-        return ""
+        return "", ""
 
 
-def _scrape_selenium(urls: list[str]) -> list[dict]:
-    """Scrape multiple pages with Selenium."""
-    results = []
-    for url in urls:
-        text = _scrape_selenium_page(url)
+def _scrape_selenium_with_discovery(root_url: str, category: str) -> list[dict]:
+    """Scrape root page + auto-discovered sub-pages via Selenium."""
+    pages = []
+
+    root_text, page_source = _scrape_selenium_page(root_url)
+    if root_text.strip():
+        pages.append({"url": root_url, "text": root_text})
+
+    if not page_source:
+        return pages
+
+    sub_urls = _discover_subpages(page_source, root_url, category)
+    logger.info(f"Discovered {len(sub_urls)} sub-pages from {root_url}")
+
+    for url in sub_urls:
+        text, _ = _scrape_selenium_page(url)
         if text.strip():
-            results.append({"url": url, "text": text})
+            pages.append({"url": url, "text": text})
         time.sleep(DELAY_BETWEEN_REQUESTS)
-    return results
+
+    return pages
 
 
 # ─── API scraping (JSON with embedded HTML) ──────────────────────────
@@ -242,13 +357,31 @@ def _extract_armenian_from_json(data) -> str:
     return "\n".join(unique)
 
 
-def _scrape_api(api_base: str, category_config: dict) -> list[dict]:
-    """Scrape via REST API aliases, with Selenium fallback."""
-    aliases = category_config.get("api_aliases", [])
-    fallback_url = category_config.get("fallback_url")
-
+def _scrape_api_with_discovery(root_url: str, api_base: str, category: str) -> list[dict]:
+    """Discover sub-pages from root web URL, fetch each via API."""
     pages = []
-    for alias in aliases:
+
+    # Fetch root page to discover links
+    html = _fetch_html(root_url)
+    if not html:
+        # Fallback: try Selenium for root page
+        text, _ = _scrape_selenium_page(root_url)
+        if text.strip():
+            return [{"url": root_url, "text": text}]
+        return []
+
+    # Discover sub-page URLs
+    sub_urls = _discover_subpages(html, root_url, category)
+    all_urls = [root_url] + sub_urls
+    logger.info(f"API: discovered {len(sub_urls)} sub-pages from {root_url}")
+
+    # Convert each web URL to an API alias and fetch
+    for url in all_urls:
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+        # Strip /hy/ prefix to get API alias (e.g., /hy/for-you/avand → for-you/avand)
+        alias = path[3:] if path.startswith("hy/") else path
+
         api_url = f"{api_base}/pages/alias/{alias}"
         try:
             resp = requests.get(
@@ -267,11 +400,12 @@ def _scrape_api(api_base: str, category_config: dict) -> list[dict]:
             logger.warning(f"API {alias} failed: {e}")
         time.sleep(1)
 
-    if not pages and fallback_url:
-        logger.info(f"API returned nothing, falling back to Selenium: {fallback_url}")
-        text = _scrape_selenium_page(fallback_url)
+    # Fallback to Selenium if API returned nothing
+    if not pages:
+        logger.info(f"API returned nothing, falling back to Selenium: {root_url}")
+        text, _ = _scrape_selenium_page(root_url)
         if text.strip():
-            pages.append({"url": fallback_url, "text": text})
+            pages.append({"url": root_url, "text": text})
 
     return pages
 
@@ -281,20 +415,20 @@ def _scrape_api(api_base: str, category_config: dict) -> list[dict]:
 def _scrape_bank_category(bank_name: str, bank_config: dict, category: str) -> list[dict]:
     """Scrape one bank/category combo using the configured method."""
     method = bank_config["method"]
-    category_config = bank_config.get(category)
+    root_url = bank_config.get(category)
 
-    if not category_config:
+    if not root_url:
         return []
 
     if method == "html":
-        return _scrape_html(category_config)
+        return _scrape_html_with_discovery(root_url, category)
 
     elif method == "selenium":
-        return _scrape_selenium(category_config)
+        return _scrape_selenium_with_discovery(root_url, category)
 
     elif method == "api":
         api_base = bank_config["api_base"]
-        return _scrape_api(api_base, category_config)
+        return _scrape_api_with_discovery(root_url, api_base, category)
 
     else:
         logger.error(f"Unknown method '{method}' for {bank_name}")

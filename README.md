@@ -126,10 +126,10 @@ Adding a new bank requires editing **only** `banks_config.py`:
 ```python
 "NewBank": {
     "method": "selenium",  # or "html" or "api"
-    "credits": ["https://newbank.am/loans", "https://newbank.am/loans/consumer"],
-    "deposits": ["https://newbank.am/deposits"],
-    "branches": ["https://newbank.am/branches"],
+    "credits": "https://newbank.am/loans",
+    "deposits": "https://newbank.am/deposits",
+    "branches": "https://newbank.am/branches",
 },
 ```
 
-Then re-run `python scraper.py`. No changes needed in `scraper.py`, `rag.py`, or `stt_agent.py`.
+Just provide the root URL for each category — the scraper automatically discovers and crawls all sub-pages. Then re-run `python scraper.py`. No changes needed in `scraper.py`, `rag.py`, or `stt_agent.py`.

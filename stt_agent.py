@@ -2,6 +2,7 @@
 LiveKit STT Agent using Groq's Whisper API (free, fast).
 Joins a LiveKit room, listens to participant audio, and transcribes Armenian speech.
 Post-processes transcriptions with Llama to fix typos, inaccuracies, and grammar.
+Speaks answers back via Silero TTS (Armenian voice).
 
 Usage:
     python stt_agent.py connect --room test-room   # Connect directly to a room
@@ -10,18 +11,22 @@ Usage:
 """
 
 import asyncio
+import functools
 import io
 import logging
 import os
+import re
 import wave
 
 import numpy as np
+import torch
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from livekit import agents, rtc
 from livekit.agents import stt
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions, NotGivenOr
 from livekit.plugins.silero import VAD
+from silero import silero_tts
 
 from pathlib import Path
 load_dotenv(Path(__file__).parent / ".env.local")
@@ -34,6 +39,9 @@ logger = logging.getLogger("stt-agent")
 WHISPER_LANGUAGE = "hy"  # Armenian
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
+TTS_SAMPLE_RATE = 48000
+TTS_SPEAKER = "hye_zara"
+TTS_CHUNK_MS = 50
 
 POST_PROCESSOR_SYSTEM_PROMPT = """\
 You are an Armenian text post-processor for a banking voice assistant STT system.
@@ -49,18 +57,37 @@ Fix these issues:
 - Word boundary errors (incorrectly split or merged words)
 - Filler sounds transcribed as words
 
-Banking domain context — users commonly say words like:
+Banking domain context \u2014 users commonly say words like:
 \u057e\u0561\u0580\u056f, \u057e\u0561\u0580\u056f\u0565\u0580, \u0561\u057e\u0561\u0576\u0564, \u0561\u057e\u0561\u0576\u0564\u0576\u0565\u0580, \u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584, \u0574\u0561\u057d\u0576\u0561\u0573\u0575\u0578\u0582\u0572, \u0574\u0561\u057d\u0576\u0561\u0573\u0575\u0578\u0582\u0572\u0576\u0565\u0580, \u0562\u0561\u0576\u056f, \u0570\u0561\u0577\u056b\u057e, \u0583\u0578\u056d\u0561\u0576\u0581\u0578\u0582\u0574, \u057e\u0573\u0561\u0580\u0578\u0582\u0574, \u0584\u0561\u0580\u057f, \u057e\u0561\u0580\u056f\u0561\u0575\u056b\u0576 \u057f\u0578\u056f\u0578\u057d\u0561\u0564\u0580\u0578\u0582\u0575\u0584, \u0561\u0574\u057d\u0561\u056f\u0561\u0576 \u057e\u0573\u0561\u0580, \u0570\u056b\u057a\u0578\u0569\u0565\u056f\u0561\u0575\u056b\u0576 \u057e\u0561\u0580\u056f, \u057d\u057a\u0561\u057c\u0578\u0572\u0561\u056f\u0561\u0576 \u057e\u0561\u0580\u056f, \u0531\u0574\u0565\u0580\u056b\u0561\u0562\u0561\u0576\u056f, \u0535\u057e\u0578\u056f\u0561\u0562\u0561\u0576\u056f, \u0531\u0580\u0564\u0577\u056b\u0576\u0562\u0561\u0576\u056f, \u053b\u0576\u0565\u056f\u0578\u0562\u0561\u0576\u056f
 Use this domain knowledge to correct ambiguous or misheard words.
 
 Rules:
 - Return ONLY the corrected Armenian text, nothing else
-- Do NOT translate — keep everything in Armenian
+- Do NOT translate \u2014 keep everything in Armenian
 - You MAY replace wrong words with the correct ones if confident about speaker intent
 - Do NOT add extra words or sentences the speaker did not say
 - Do NOT explain your changes
 - If the input is already clean, return it unchanged
 - If the input is just noise or silence artifacts (e.g. 'Subtitle', 'Thank you', repeated single characters), return exactly: NOISE"""
+
+TTS_NORMALIZER_PROMPT = """\
+You are a text normalizer preparing Armenian text for a TTS (text-to-speech) engine.
+The TTS cannot read digits, symbols, or abbreviations \u2014 you must convert them ALL to Armenian words.
+
+Convert:
+- Numbers: "15" \u2192 "\u057f\u0561\u057d\u0576\u0570\u056b\u0576\u0563"
+- Percentages: "15%" \u2192 "\u057f\u0561\u057d\u0576\u0570\u056b\u0576\u0563 \u057f\u0578\u056f\u0578\u057d"
+- Currency: "3,000,000 AMD" \u2192 "\u0565\u0580\u0565\u0584 \u0574\u056b\u056c\u056b\u0578\u0576 \u0564\u0580\u0561\u0574", "$500" \u2192 "\u0570\u056b\u0576\u0563 \u0570\u0561\u0580\u0575\u0578\u0582\u0580 \u0564\u0578\u056c\u0561\u0580"
+- Decimals: "10.5%" \u2192 "\u057f\u0561\u057d \u0561\u0574\u0562\u0578\u0572\u057b \u056f\u0565\u057d \u057f\u0578\u056f\u0578\u057d", "18.42%" \u2192 "\u057f\u0561\u057d\u0576\u0578\u0582\u0569 \u0561\u0574\u0562\u0578\u0572\u057b \u0584\u0561\u057c\u0561\u057d\u0578\u0582\u0576\u0565\u0580\u056f\u0578\u0582 \u057f\u0578\u056f\u0578\u057d"
+- Ranges: "5-10" \u2192 "\u0570\u056b\u0576\u0563\u056b\u0581 \u057f\u0561\u057d", "18.42-22.79%" \u2192 "\u057f\u0561\u057d\u0576\u0578\u0582\u0569 \u0561\u0574\u0562\u0578\u0572\u057b \u0584\u0561\u057c\u0561\u057d\u0578\u0582\u0576\u0565\u0580\u056f\u0578\u0582\u056b\u0581 \u0584\u057d\u0561\u0576\u0565\u0580\u056f\u0578\u0582 \u0561\u0574\u0562\u0578\u0572\u057b \u0575\u0578\u0569\u0561\u0576\u0561\u057d\u0578\u0582\u0576\u056b\u0576\u0576 \u057f\u0578\u056f\u0578\u057d"
+- Abbreviations: common Armenian banking abbreviations to full words
+- IMPORTANT: For complex decimal ranges like "18.42-22.79%", break into simple parts: spell out each number fully in Armenian words, use "\u056b\u0581" for the dash/range, and "\u057f\u0578\u056f\u0578\u057d" for %
+
+Rules:
+- Return ONLY the normalized Armenian text
+- Keep all non-numeric Armenian text EXACTLY unchanged
+- Do NOT add explanations
+- Do NOT remove or rephrase any Armenian words"""
 
 
 # ─── STT Post-Processor (cleans up Whisper output via LLM) ────────────
@@ -96,6 +123,79 @@ class STTPostProcessor:
         except Exception as e:
             logger.warning(f"Post-processing failed, using raw text: {e}")
             return raw_text
+
+
+# ─── Silero TTS Helper ─────────────────────────────────────────────────
+
+class SileroTTSHelper:
+    """Synthesizes Armenian speech using Silero V5 CIS Base model.
+    Normalizes numbers/symbols to Armenian words via LLM before synthesis."""
+
+    def __init__(self):
+        self._model, _ = silero_tts(language="ru", speaker="v5_cis_base")
+        self._groq = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+        logger.info(f"Silero TTS initialized (speaker={TTS_SPEAKER}, sr={TTS_SAMPLE_RATE})")
+
+    async def _normalize_for_tts(self, text: str) -> str:
+        """Use Llama to convert numbers/symbols to Armenian words for TTS."""
+        if not re.search(r"\d", text):
+            return text
+        try:
+            response = await self._groq.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": TTS_NORMALIZER_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=len(text) * 3,
+            )
+            normalized = response.choices[0].message.content.strip()
+            if normalized:
+                logger.info(f"TTS normalized: numbers converted to words")
+                return normalized
+        except Exception as e:
+            logger.warning(f"TTS normalization failed, using raw text: {e}")
+        return text
+
+    def _synthesize_sync(self, text: str) -> bytes:
+        """Run TTS inference (CPU-bound, call from executor)."""
+        audio_tensor = self._model.apply_tts(
+            text=text, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE,
+        )
+        pcm_int16 = (audio_tensor.numpy() * 32767).astype(np.int16)
+        return pcm_int16.tobytes()
+
+    async def synthesize(self, text: str) -> rtc.AudioFrame:
+        """Normalize text and synthesize to an AudioFrame."""
+        text = await self._normalize_for_tts(text)
+        loop = asyncio.get_event_loop()
+        pcm_bytes = await loop.run_in_executor(
+            None, functools.partial(self._synthesize_sync, text),
+        )
+        samples_per_channel = len(pcm_bytes) // 2  # int16 = 2 bytes per sample
+        return rtc.AudioFrame(
+            data=pcm_bytes,
+            sample_rate=TTS_SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+            samples_per_channel=samples_per_channel,
+        )
+
+
+def _chunk_audio_frame(frame: rtc.AudioFrame, chunk_ms: int = TTS_CHUNK_MS) -> list[rtc.AudioFrame]:
+    """Split a large AudioFrame into smaller chunks for smooth streaming."""
+    samples_per_chunk = frame.sample_rate * chunk_ms // 1000
+    data = np.frombuffer(frame.data, dtype=np.int16)
+    chunks = []
+    for i in range(0, len(data), samples_per_chunk):
+        chunk_data = data[i:i + samples_per_chunk]
+        chunks.append(rtc.AudioFrame(
+            data=chunk_data.tobytes(),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+            samples_per_channel=len(chunk_data),
+        ))
+    return chunks
 
 
 # ─── Groq Whisper STT adapter for LiveKit ─────────────────────────────
@@ -165,9 +265,10 @@ async def entrypoint(ctx: agents.JobContext):
     logger.info(f"Connecting to room: {ctx.room.name}")
     await ctx.connect()
 
-    # Initialize Groq Whisper STT, post-processor, and RAG
+    # Initialize Groq Whisper STT, post-processor, RAG, and TTS
     whisper_stt = GroqWhisperSTT()
     post_processor = STTPostProcessor()
+    tts_helper = SileroTTSHelper()
 
     from rag import BankRAG
     rag = BankRAG()
@@ -180,6 +281,13 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Wrap non-streaming Whisper with VAD-based StreamAdapter
     streaming_stt = stt.StreamAdapter(stt=whisper_stt, vad=vad)
+
+    # Publish an audio track so the agent can speak back
+    audio_source = rtc.AudioSource(TTS_SAMPLE_RATE, NUM_CHANNELS)
+    audio_track = rtc.LocalAudioTrack.create_audio_track("agent-voice", audio_source)
+    publish_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+    await ctx.room.local_participant.publish_track(audio_track, publish_options)
+    logger.info("Published agent audio track for TTS output")
 
     # Wait for a participant to connect
     participant = await ctx.wait_for_participant()
@@ -219,6 +327,14 @@ async def entrypoint(ctx: agents.JobContext):
                     answer = await rag.answer(cleaned_text)
                     print(f"[BOT]  {answer}")
                     print(f"{'='*60}\n")
+
+                    # Step 3: Speak the answer via TTS
+                    try:
+                        audio_frame = await tts_helper.synthesize(answer)
+                        for chunk in _chunk_audio_frame(audio_frame):
+                            await audio_source.capture_frame(chunk)
+                    except Exception as e:
+                        logger.error(f"TTS failed: {e}")
 
     # Run audio feeding and transcription reading concurrently
     await asyncio.gather(_feed_audio(), _read_transcriptions())
