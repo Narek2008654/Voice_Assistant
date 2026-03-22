@@ -188,3 +188,6 @@ data/bank_data.json
 
 # ChromaDB vector store (re-generate by running the agent)
 data/chroma_db/
+
+# Silero model cache
+latest_silero_models.yml
